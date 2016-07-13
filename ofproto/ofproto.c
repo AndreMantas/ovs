@@ -784,8 +784,7 @@ void
 ofproto_set_cpu_mask(const char *cmask)
 {
     free(pmd_cpu_mask);
-
-    pmd_cpu_mask = cmask ? xstrdup(cmask) : NULL;
+    pmd_cpu_mask = nullable_xstrdup(cmask);
 }
 
 void
@@ -811,7 +810,7 @@ void
 ofproto_set_dp_desc(struct ofproto *p, const char *dp_desc)
 {
     free(p->dp_desc);
-    p->dp_desc = dp_desc ? xstrdup(dp_desc) : NULL;
+    p->dp_desc = nullable_xstrdup(dp_desc);
 }
 
 int
@@ -6696,6 +6695,27 @@ out:
     return error;
 }
 
+/* Implements the OFPGC11_ADD_OR_MOD command which creates the group when it does not
+ * exist yet and modifies it otherwise */
+static enum ofperr
+add_or_modify_group(struct ofproto *ofproto, const struct ofputil_group_mod *gm)
+{
+    struct ofgroup *ofgroup;
+    enum ofperr error;
+    bool exists;
+
+    ovs_rwlock_rdlock(&ofproto->groups_rwlock);
+    exists = ofproto_group_lookup__(ofproto, gm->group_id, &ofgroup);
+    ovs_rwlock_unlock(&ofproto->groups_rwlock);
+
+    if (!exists) {
+        error = add_group(ofproto, gm);
+    } else {
+        error = modify_group(ofproto, gm);
+    }
+    return error;
+}
+
 static void
 delete_group__(struct ofproto *ofproto, struct ofgroup *ofgroup)
     OVS_RELEASES(ofproto->groups_rwlock)
@@ -6783,6 +6803,10 @@ handle_group_mod(struct ofconn *ofconn, const struct ofp_header *oh)
 
     case OFPGC11_MODIFY:
         error = modify_group(ofproto, &gm);
+        break;
+
+    case OFPGC11_ADD_OR_MOD:
+        error = add_or_modify_group(ofproto, &gm);
         break;
 
     case OFPGC11_DELETE:

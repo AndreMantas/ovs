@@ -209,6 +209,8 @@ AC_DEFUN([OVS_CHECK_DPDK], [
       [AC_DEFINE([VHOST_CUSE], [1], [DPDK vhost-cuse support enabled, vhost-user disabled.])
        DPDK_EXTRA_LIB="-lfuse"])
 
+    AC_SEARCH_LIBS([get_mempolicy],[numa],[],[AC_MSG_ERROR([unable to find libnuma, install the dependency package])])
+
     # On some systems we have to add -ldl to link with dpdk
     #
     # This code, at first, tries to link without -ldl (""),
@@ -390,6 +392,7 @@ AC_DEFUN([OVS_CHECK_LINUX_COMPAT], [
 
   OVS_GREP_IFELSE([$KSRC/include/linux/etherdevice.h], [eth_hw_addr_random])
   OVS_GREP_IFELSE([$KSRC/include/linux/etherdevice.h], [ether_addr_copy])
+  OVS_GREP_IFELSE([$KSRC/nclude/linux/if_ether.h], [inner_eth_hdr])
 
   OVS_GREP_IFELSE([$KSRC/include/uapi/linux/if_link.h], [IFLA_GENEVE_TOS])
   OVS_GREP_IFELSE([$KSRC/include/uapi/linux/if_link.h], [rtnl_link_stats64])
@@ -408,7 +411,9 @@ AC_DEFUN([OVS_CHECK_LINUX_COMPAT], [
                   [OVS_DEFINE([HAVE_INET_GET_LOCAL_PORT_RANGE_USING_NET])])
   OVS_GREP_IFELSE([$KSRC/include/net/ip.h], [ip_defrag.*net],
                   [OVS_DEFINE([HAVE_IP_DEFRAG_TAKES_NET])])
-  OVS_GREP_IFELSE([$KSRC/include/net/ip.h], [ip_do_fragment])
+  OVS_FIND_PARAM_IFELSE([$KSRC/include/net/ip.h],
+                        [ip_do_fragment], [net],
+                        [OVS_DEFINE([HAVE_IP_DO_FRAGMENT_TAKES_NET])])
   OVS_GREP_IFELSE([$KSRC/include/net/ip.h], [ip_skb_dst_mtu])
 
   OVS_GREP_IFELSE([$KSRC/include/net/ip.h], [IPSKB_FRAG_PMTU],
@@ -428,10 +433,22 @@ AC_DEFUN([OVS_CHECK_LINUX_COMPAT], [
   OVS_GREP_IFELSE([$KSRC/include/net/inetpeer.h], [vif],
                   [OVS_DEFINE([HAVE_INETPEER_VIF_SUPPORT])])
 
-  OVS_GREP_IFELSE([$KSRC/include/net/dst_metadata.h], [metadata_dst])
+  dnl Check for dst_cache and ipv6 lable to use backported tunnel infrastructure.
+  dnl OVS does not really need ipv6 label field, but its presence signifies that
+  dnl the stack has all required ipv6 support.
+  dnl OVS also does not need dst_cache But this dependency allows us to write
+  dnl much cleaner code.
+
+  OVS_FIND_FIELD_IFELSE([$KSRC/include/net/ip_tunnels.h], [ip_tunnel_key],
+                        [label],
+                        [OVS_GREP_IFELSE([$KSRC/include/net/ip_tunnels.h],
+                                         [iptunnel_pull_offloads],
+			[OVS_GREP_IFELSE([$KSRC/include/net/dst_cache.h], [dst_cache],
+                                         [OVS_DEFINE([USE_UPSTREAM_TUNNEL])])])])
 
   OVS_GREP_IFELSE([$KSRC/include/linux/net.h], [sock_create_kern.*net],
                   [OVS_DEFINE([HAVE_SOCK_CREATE_KERN_NET])])
+  OVS_GREP_IFELSE([$KSRC/include/linux/netdevice.h], [ndo_fill_metadata_dst])
   OVS_GREP_IFELSE([$KSRC/include/linux/netdevice.h], [dev_disable_lro])
   OVS_GREP_IFELSE([$KSRC/include/linux/netdevice.h], [dev_get_stats])
   OVS_GREP_IFELSE([$KSRC/include/linux/netdevice.h], [dev_get_by_index_rcu])
@@ -439,6 +456,8 @@ AC_DEFUN([OVS_CHECK_LINUX_COMPAT], [
   OVS_GREP_IFELSE([$KSRC/include/linux/netdevice.h], [__skb_gso_segment])
   OVS_GREP_IFELSE([$KSRC/include/linux/netdevice.h], [can_checksum_protocol])
   OVS_GREP_IFELSE([$KSRC/include/linux/netdevice.h], [ndo_get_iflink])
+  OVS_GREP_IFELSE([$KSRC/include/linux/netdevice.h], [ndo_add_vxlan_port])
+  OVS_GREP_IFELSE([$KSRC/include/linux/netdevice.h], [ndo_add_geneve_port])
   OVS_GREP_IFELSE([$KSRC/include/linux/netdevice.h], [netdev_features_t])
   dnl Ubuntu kernel 3.13 has defined this struct but not used for netdev->tstats.
   dnl So check type of tstats.
@@ -502,8 +521,8 @@ AC_DEFUN([OVS_CHECK_LINUX_COMPAT], [
                   [OVS_DEFINE([HAVE_PROTO_DATA_VALID])])
   OVS_GREP_IFELSE([$KSRC/include/linux/skbuff.h], [skb_checksum_start_offset])
   OVS_GREP_IFELSE([$KSRC/include/linux/skbuff.h], [inner_protocol])
-  OVS_GREP_IFELSE([$KSRC/include/linux/skbuff.h], [inner_mac_header])
-  OVS_GREP_IFELSE([$KSRC/include/linux/skbuff.h], [inner_network_header])
+  OVS_GREP_IFELSE([$KSRC/include/linux/skbuff.h], [inner_protocol_type])
+  OVS_GREP_IFELSE([$KSRC/include/linux/skbuff.h], [skb_inner_transport_offset])
   OVS_GREP_IFELSE([$KSRC/include/linux/skbuff.h], [kfree_skb_list])
   OVS_GREP_IFELSE([$KSRC/include/linux/skbuff.h], [skb_scrub_packet.*xnet],
 		  [OVS_DEFINE([HAVE_SKB_SCRUB_PACKET_XNET])])
@@ -536,6 +555,7 @@ AC_DEFUN([OVS_CHECK_LINUX_COMPAT], [
   OVS_GREP_IFELSE([$KSRC/include/linux/skbuff.h], [skb_ensure_writable])
   OVS_GREP_IFELSE([$KSRC/include/linux/skbuff.h], [skb_vlan_pop])
   OVS_GREP_IFELSE([$KSRC/include/linux/skbuff.h], [skb_vlan_push])
+  OVS_GREP_IFELSE([$KSRC/include/linux/skbuff.h], [skb_clear_hash_if_not_l4])
 
   OVS_GREP_IFELSE([$KSRC/include/linux/types.h], [bool],
                   [OVS_DEFINE([HAVE_BOOL_TYPE])])
@@ -596,21 +616,22 @@ AC_DEFUN([OVS_CHECK_LINUX_COMPAT], [
 
   OVS_GREP_IFELSE([$KSRC/include/net/vxlan.h], [struct vxlan_metadata],
                   [OVS_DEFINE([HAVE_VXLAN_METADATA])])
-  OVS_GREP_IFELSE([$KSRC/include/net/vxlan.h], [VXLAN_HF_RCO])
   OVS_GREP_IFELSE([$KSRC/include/net/udp.h], [udp_flow_src_port],
                   [OVS_GREP_IFELSE([$KSRC/include/net/udp.h], [inet_get_local_port_range(net],
                                    [OVS_DEFINE([HAVE_UDP_FLOW_SRC_PORT])])])
   OVS_GREP_IFELSE([$KSRC/include/net/udp.h], [udp_v4_check])
   OVS_GREP_IFELSE([$KSRC/include/net/udp.h], [udp_set_csum])
   OVS_GREP_IFELSE([$KSRC/include/net/udp_tunnel.h], [udp_tunnel_gro_complete])
-  OVS_GREP_IFELSE([$KSRC/include/net/udp_tunnel.h], [ipv6_v6only],
-                  [OVS_DEFINE([HAVE_UDP_TUNNEL_IPV6])])
+  OVS_FIND_FIELD_IFELSE([$KSRC/include/net/udp_tunnel.h], [udp_tunnel_sock_cfg],
+                        [gro_receive])
 
   OVS_GREP_IFELSE([$KSRC/include/linux/skbuff.h], [ignore_df],
                   [OVS_DEFINE([HAVE_IGNORE_DF_RENAME])])
   OVS_GREP_IFELSE([$KSRC/include/uapi/linux/netdevice.h], [NET_NAME_UNKNOWN],
                   [OVS_DEFINE([HAVE_NET_NAME_UNKNOWN])])
 
+  OVS_GREP_IFELSE([$KSRC/include/net/sock.h], [sk_no_check_tx])
+  OVS_GREP_IFELSE([$KSRC/include/linux/udp.h], [no_check6_tx])
   OVS_GREP_IFELSE([$KSRC/include/linux/utsrelease.h], [el6],
                   [OVS_DEFINE([HAVE_RHEL6_PER_CPU])])
 

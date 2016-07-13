@@ -69,6 +69,11 @@
       </p>
     </column>
 
+    <column name="load_balancer">
+      Load balance a virtual ipv4 address to a set of logical port endpoint
+      ipv4 addresses.
+    </column>
+
     <column name="acls">
       Access control rules that apply to packets within the logical switch.
     </column>
@@ -134,6 +139,11 @@
             to model direct connectivity to an existing network.
           </dd>
 
+          <dt><code>l2gateway</code></dt>
+          <dd>
+            A connection to a physical network.
+          </dd>
+
           <dt><code>vtep</code></dt>
           <dd>
             A port to a logical switch on a VTEP gateway.
@@ -173,6 +183,27 @@
           uses its local configuration to determine exactly how to connect to
           this locally accessible network.
         </column>
+      </group>
+
+      <group title="Options for l2gateway ports">
+        <p>
+          These options apply when <ref column="type"/> is
+          <code>l2gateway</code>.
+        </p>
+
+        <column name="options" key="network_name">
+          Required.  The name of the network to which the <code>l2gateway</code>
+          port is connected.  The L2 gateway, via <code>ovn-controller</code>,
+          uses its local configuration to determine exactly how to connect to
+          this network.
+        </column>
+
+        <column name="options" key="l2gateway-chassis">
+          Required. The chassis on which the <code>l2gateway</code> logical
+          port should be bound to. <code>ovn-controller</code> running on the
+          defined chassis will connect this logical port to the physical network.
+        </column>
+
       </group>
 
       <group title="Options for vtep ports">
@@ -484,6 +515,84 @@
     </group>
   </table>
 
+  <table name="Address_Set" title="Address Sets">
+    <p>
+      Each row in this table represents a named set of addresses.
+      An address set may contain Ethernet, IPv4, or IPv6 addresses
+      with optional bitwise or CIDR masks.
+      Address set may ultimately be used in ACLs to compare against
+      fields such as <code>ip4.src</code> or <code>ip6.src</code>.
+      A single address set must contain addresses of the
+      same type. As an example, the following would create an address set
+      with three IP addresses:
+    </p>
+
+    <pre>
+      ovn-nbctl create Address_Set name=set1 addresses='10.0.0.1 10.0.0.2 10.0.0.3'
+    </pre>
+
+    <p>
+      Address sets may be used in the <ref column="match" table="ACL"/> column
+      of the <ref table="ACL"/> table.  For syntax information, see the details
+      of the expression language used for the <ref column="match"
+      table="Logical_Flow" db="OVN_Southbound"/> column in the <ref
+      table="Logical_Flow" db="OVN_Southbound"/> table of the <ref
+      db="OVN_Southbound"/> database.
+    </p>
+
+    <column name="name">
+      A name for the address set.  This must be unique among all address sets.
+    </column>
+
+    <column name="addresses">
+      The set of addresses in string form.
+    </column>
+
+    <group title="Common Columns">
+      <column name="external_ids">
+        See <em>External IDs</em> at the beginning of this document.
+      </column>
+    </group>
+  </table>
+
+  <table name="Load_Balancer" title="load balancer">
+    <p>
+      Each row represents one load balancer.
+    </p>
+
+    <column name="vips">
+      <p>
+        A map of virtual IPv4 addresses (and an optional port number with
+        <code>:</code> as a separator) associated with this load balancer and
+        their corresponding endpoint IPv4 addresses (and optional port numbers
+        with <code>:</code> as separators) separated by commas.  If
+        the destination IP address (and port number) of a packet leaving a
+        container or a VM matches the virtual IPv4 address (and port number)
+        provided here as a key, then OVN will statefully replace the
+        destination IP address by one of the provided IPv4 address (and port
+        number) in this map as a value.  Examples for keys are "192.168.1.4"
+        and "172.16.1.8:80".  Examples for value are "10.0.0.1, 10.0.0.2" and
+        "20.0.0.10:8800, 20.0.0.11:8800".
+      </p>
+    </column>
+
+    <column name="protocol">
+      <p>
+        Valid protocols are <code>tcp</code> or <code>udp</code>.  This column
+        is useful when a port number is provided as part of the
+        <code>vips</code> column.  If this column is empty and a port number
+        is provided as part of <code>vips</code> column, OVN assumes the
+        protocol to be <code>tcp</code>.
+      </p>
+    </column>
+
+    <group title="Common Columns">
+      <column name="external_ids">
+        See <em>External IDs</em> at the beginning of this document.
+      </column>
+    </group>
+  </table>
+
   <table name="ACL" title="Access Control List (ACL) rule">
     <p>
       Each row in this table represents one ACL rule for a logical switch
@@ -620,10 +729,6 @@
       One or more static routes for the router.
     </column>
 
-    <column name="default_gw">
-      IP address to use as default gateway, if any.
-    </column>
-
     <column name="enabled">
       This column is used to administratively set router state.  If this column
       is empty or is set to <code>true</code>, the router is enabled.  If this
@@ -658,7 +763,7 @@
         </p>
       </column>
     </group>
-    
+
     <group title="Common Columns">
       <column name="external_ids">
         See <em>External IDs</em> at the beginning of this document.
@@ -689,11 +794,13 @@
       </p>
     </column>
 
-    <column name="network">
-      The IP address of the router and the netmask.  For example,
-      <code>192.168.0.1/24</code> indicates that the router's IP address is
-      192.168.0.1 and that packets destined to 192.168.0.<var>x</var> should be
-      routed to this port.
+    <column name="networks">
+      <p>
+        The IP addresses and netmasks of the router.  For example,
+        <code>192.168.0.1/24</code> indicates that the router's IP
+        address is 192.168.0.1 and that packets destined to
+        192.168.0.<var>x</var> should be routed to this port.
+      </p>
     </column>
 
     <column name="mac">

@@ -97,11 +97,13 @@ struct datapath {
  * @input_vport: The original vport packet came in on. This value is cached
  * when a packet is received by OVS.
  * @mru: The maximum received fragement size; 0 if the packet is not
+ * @cutlen: The number of bytes from the packet end to be removed.
  * fragmented.
  */
 struct ovs_skb_cb {
 	struct vport		*input_vport;
 	u16			mru;
+	u32			cutlen;
 };
 #define OVS_CB(skb) ((struct ovs_skb_cb *)(skb)->cb)
 
@@ -118,7 +120,6 @@ struct ovs_skb_cb {
  */
 struct dp_upcall_info {
 	struct ip_tunnel_info *egress_tun_info;
-	const void *egress_tun_opts;
 	const struct nlattr *userdata;
 	const struct nlattr *actions;
 	int actions_len;
@@ -193,7 +194,8 @@ extern struct genl_multicast_group ovs_dp_vport_multicast_group;
 void ovs_dp_process_packet(struct sk_buff *skb, struct sw_flow_key *key);
 void ovs_dp_detach_port(struct vport *);
 int ovs_dp_upcall(struct datapath *, struct sk_buff *,
-		  const struct sw_flow_key *, const struct dp_upcall_info *);
+		  const struct sw_flow_key *, const struct dp_upcall_info *,
+		  uint32_t cutlen);
 
 const char *ovs_dp_name(const struct datapath *dp);
 struct sk_buff *ovs_vport_cmd_build_info(struct vport *, u32 pid, u32 seq,

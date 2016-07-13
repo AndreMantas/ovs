@@ -60,6 +60,7 @@ TESTSUITE_AT = \
 	tests/ofproto-dpif.at \
 	tests/bridge.at \
 	tests/ofproto.at \
+	tests/netdev-type.at \
 	tests/ovsdb.at \
 	tests/ovsdb-log.at \
 	tests/ovsdb-types.at \
@@ -75,6 +76,7 @@ TESTSUITE_AT = \
 	tests/ovsdb-execution.at \
 	tests/ovsdb-trigger.at \
 	tests/ovsdb-tool.at \
+	tests/ovsdb-replication.at \
 	tests/ovsdb-server.at \
 	tests/ovsdb-monitor.at \
 	tests/ovsdb-idl.at \

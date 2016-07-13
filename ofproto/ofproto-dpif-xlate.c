@@ -238,6 +238,7 @@ struct xlate_ctx {
     ofp_port_t nf_output_iface; /* Output interface index for NetFlow. */
     bool exit;                  /* No further actions should be processed. */
     mirror_mask_t mirrors;      /* Bitmap of associated mirrors. */
+    int mirror_snaplen;         /* Max size of a mirror packet in byte. */
 
    /* Freezing Translation
     * ====================
@@ -1557,7 +1558,6 @@ group_best_live_bucket(const struct xlate_ctx *ctx,
 {
     struct ofputil_bucket *best_bucket = NULL;
     uint32_t best_score = 0;
-    int i = 0;
 
     struct ofputil_bucket *bucket;
     const struct ovs_list *buckets;
@@ -1565,13 +1565,13 @@ group_best_live_bucket(const struct xlate_ctx *ctx,
     group_dpif_get_buckets(group, &buckets);
     LIST_FOR_EACH (bucket, list_node, buckets) {
         if (bucket_is_alive(ctx, bucket, 0)) {
-            uint32_t score = (hash_int(i, basis) & 0xffff) * bucket->weight;
+            uint32_t score =
+                (hash_int(bucket->bucket_id, basis) & 0xffff) * bucket->weight;
             if (score >= best_score) {
                 best_bucket = bucket;
                 best_score = score;
             }
         }
-        i++;
     }
 
     return best_bucket;
@@ -1702,11 +1702,14 @@ mirror_packet(struct xlate_ctx *ctx, struct xbundle *xbundle,
         mirror_mask_t dup_mirrors;
         struct ofbundle *out;
         int out_vlan;
+        int snaplen;
 
         /* Get the details of the mirror represented by the rightmost 1-bit. */
         bool has_mirror = mirror_get(xbridge->mbridge, raw_ctz(mirrors),
-                                     &vlans, &dup_mirrors, &out, &out_vlan);
+                                     &vlans, &dup_mirrors,
+                                     &out, &snaplen, &out_vlan);
         ovs_assert(has_mirror);
+
 
         /* If this mirror selects on the basis of VLAN, and it does not select
          * 'vlan', then discard this mirror and go on to the next one. */
@@ -1723,6 +1726,7 @@ mirror_packet(struct xlate_ctx *ctx, struct xbundle *xbundle,
          * done now to ensure that output_normal(), below, doesn't recursively
          * output to the same mirrors. */
         ctx->mirrors |= dup_mirrors;
+        ctx->mirror_snaplen = snaplen;
 
         /* Send the packet to the mirror. */
         if (out) {
@@ -1746,6 +1750,7 @@ mirror_packet(struct xlate_ctx *ctx, struct xbundle *xbundle,
         /* output_normal() could have recursively output (to different
          * mirrors), so make sure that we don't send duplicates. */
         mirrors &= ~ctx->mirrors;
+        ctx->mirror_snaplen = 0;
     }
 }
 
@@ -3001,7 +3006,7 @@ compose_output_action__(struct xlate_ctx *ctx, ofp_port_t ofp_port,
 
     /* If 'struct flow' gets additional metadata, we'll need to zero it out
      * before traversing a patch port. */
-    BUILD_ASSERT_DECL(FLOW_WC_SEQ == 35);
+    BUILD_ASSERT_DECL(FLOW_WC_SEQ == 36);
     memset(&flow_tnl, 0, sizeof flow_tnl);
 
     if (!xport) {
@@ -3009,6 +3014,9 @@ compose_output_action__(struct xlate_ctx *ctx, ofp_port_t ofp_port,
         return;
     } else if (xport->config & OFPUTIL_PC_NO_FWD) {
         xlate_report(ctx, "OFPPC_NO_FWD set, skipping output");
+        return;
+    } else if (ctx->mirror_snaplen != 0 && xport->odp_port == ODPP_NONE) {
+        xlate_report(ctx, "Mirror truncate to ODPP_NONE, skipping output");
         return;
     } else if (check_stp) {
         if (is_stp(&ctx->base_flow)) {
@@ -3226,11 +3234,26 @@ compose_output_action__(struct xlate_ctx *ctx, ofp_port_t ofp_port,
                     /* Tunnel push-pop action is not compatible with
                      * IPFIX action. */
                     compose_ipfix_action(ctx, out_port);
+
+                    /* Handle truncation of the mirrored packet. */
+                    if (ctx->mirror_snaplen > 0 &&
+                        ctx->mirror_snaplen < UINT16_MAX) {
+                        struct ovs_action_trunc *trunc;
+
+                        trunc = nl_msg_put_unspec_uninit(ctx->odp_actions,
+                                                         OVS_ACTION_ATTR_TRUNC,
+                                                         sizeof *trunc);
+                        trunc->max_len = ctx->mirror_snaplen;
+                        if (!ctx->xbridge->support.trunc) {
+                            ctx->xout->slow |= SLOW_ACTION;
+                        }
+                    }
+
                     nl_msg_put_odp_port(ctx->odp_actions,
                                         OVS_ACTION_ATTR_OUTPUT,
                                         out_port);
-               }
-           }
+                }
+            }
         }
 
         ctx->sflow_odp_port = odp_port;
@@ -3995,6 +4018,56 @@ xlate_output_reg_action(struct xlate_ctx *ctx,
 }
 
 static void
+xlate_output_trunc_action(struct xlate_ctx *ctx,
+                    ofp_port_t port, uint32_t max_len)
+{
+    bool support_trunc = ctx->xbridge->support.trunc;
+    struct ovs_action_trunc *trunc;
+    char name[OFP_MAX_PORT_NAME_LEN];
+
+    switch (port) {
+    case OFPP_TABLE:
+    case OFPP_NORMAL:
+    case OFPP_FLOOD:
+    case OFPP_ALL:
+    case OFPP_CONTROLLER:
+    case OFPP_NONE:
+        ofputil_port_to_string(port, name, sizeof name);
+        xlate_report(ctx, "output_trunc does not support port: %s", name);
+        break;
+    case OFPP_LOCAL:
+    case OFPP_IN_PORT:
+    default:
+        if (port != ctx->xin->flow.in_port.ofp_port) {
+            const struct xport *xport = get_ofp_port(ctx->xbridge, port);
+
+            if (xport == NULL || xport->odp_port == ODPP_NONE) {
+                /* Since truncate happens at its following output action, if
+                 * the output port is a patch port, the behavior is somehow
+                 * unpredicable. For simpilicity, disallow this case. */
+                ofputil_port_to_string(port, name, sizeof name);
+                XLATE_REPORT_ERROR(ctx, "bridge %s: "
+                         "output_trunc does not support port: %s",
+                         ctx->xbridge->name, name);
+                break;
+            }
+
+            trunc = nl_msg_put_unspec_uninit(ctx->odp_actions,
+                                OVS_ACTION_ATTR_TRUNC,
+                                sizeof *trunc);
+            trunc->max_len = max_len;
+            xlate_output_action(ctx, port, max_len, false);
+            if (!support_trunc) {
+                ctx->xout->slow |= SLOW_ACTION;
+            }
+        } else {
+            xlate_report(ctx, "skipping output to input port");
+        }
+        break;
+    }
+}
+
+static void
 xlate_enqueue_action(struct xlate_ctx *ctx,
                      const struct ofpact_enqueue *enqueue)
 {
@@ -4333,6 +4406,7 @@ freeze_unroll_actions(const struct ofpact *a, const struct ofpact *end,
     for (; a < end; a = ofpact_next(a)) {
         switch (a->type) {
         case OFPACT_OUTPUT_REG:
+        case OFPACT_OUTPUT_TRUNC:
         case OFPACT_GROUP:
         case OFPACT_OUTPUT:
         case OFPACT_CONTROLLER:
@@ -4584,6 +4658,7 @@ recirc_for_mpls(const struct ofpact *a, struct xlate_ctx *ctx)
 
     /* Output actions  do not require recirculation. */
     case OFPACT_OUTPUT:
+    case OFPACT_OUTPUT_TRUNC:
     case OFPACT_ENQUEUE:
     case OFPACT_OUTPUT_REG:
     /* Set actions that don't touch L3+ fields do not require recirculation. */
@@ -4931,6 +5006,11 @@ do_xlate_actions(const struct ofpact *ofpacts, size_t ofpacts_len,
 
         case OFPACT_OUTPUT_REG:
             xlate_output_reg_action(ctx, ofpact_get_OUTPUT_REG(a));
+            break;
+
+        case OFPACT_OUTPUT_TRUNC:
+            xlate_output_trunc_action(ctx, ofpact_get_OUTPUT_TRUNC(a)->port,
+                                ofpact_get_OUTPUT_TRUNC(a)->max_len);
             break;
 
         case OFPACT_LEARN:
@@ -5667,18 +5747,21 @@ xlate_resume(struct ofproto_dpif *ofproto,
     return error == XLATE_BRIDGE_NOT_FOUND ? OFPERR_NXR_STALE : 0;
 }
 
-/* Sends 'packet' out 'ofport'.
+/* Sends 'packet' out 'ofport'. If 'port' is a tunnel and that tunnel type
+ * supports a notion of an OAM flag, sets it if 'oam' is true.
  * May modify 'packet'.
  * Returns 0 if successful, otherwise a positive errno value. */
 int
-xlate_send_packet(const struct ofport_dpif *ofport, struct dp_packet *packet)
+xlate_send_packet(const struct ofport_dpif *ofport, bool oam,
+                  struct dp_packet *packet)
 {
     struct xlate_cfg *xcfg = ovsrcu_get(struct xlate_cfg *, &xcfgp);
     struct xport *xport;
-    struct ofpact_output output;
+    uint64_t ofpacts_stub[1024 / 8];
+    struct ofpbuf ofpacts;
     struct flow flow;
 
-    ofpact_init(&output.ofpact, OFPACT_OUTPUT, sizeof output);
+    ofpbuf_use_stack(&ofpacts, ofpacts_stub, sizeof ofpacts_stub);
     /* Use OFPP_NONE as the in_port to avoid special packet processing. */
     flow_extract(packet, &flow);
     flow.in_port.ofp_port = OFPP_NONE;
@@ -5687,12 +5770,19 @@ xlate_send_packet(const struct ofport_dpif *ofport, struct dp_packet *packet)
     if (!xport) {
         return EINVAL;
     }
-    output.port = xport->ofp_port;
-    output.max_len = 0;
+
+    if (oam) {
+        struct ofpact_set_field *sf = ofpact_put_SET_FIELD(&ofpacts);
+
+        sf->field = mf_from_id(MFF_TUN_FLAGS);
+        sf->value.be16 = htons(NX_TUN_FLAG_OAM);
+        sf->mask.be16 = htons(NX_TUN_FLAG_OAM);
+    }
+
+    ofpact_put_OUTPUT(&ofpacts)->port = xport->ofp_port;
 
     return ofproto_dpif_execute_actions(xport->xbridge->ofproto, &flow, NULL,
-                                        &output.ofpact, sizeof output,
-                                        packet);
+                                        ofpacts.data, ofpacts.size, packet);
 }
 
 struct xlate_cache *

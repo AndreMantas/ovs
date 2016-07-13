@@ -1,5 +1,6 @@
 openvswitch_sources += \
 	linux/compat/dev-openvswitch.c \
+	linux/compat/dst_cache.c \
 	linux/compat/exthdrs_core.c \
 	linux/compat/flex_array.c \
 	linux/compat/flow_dissector.c \
@@ -10,6 +11,7 @@ openvswitch_sources += \
 	linux/compat/inet_fragment.c \
 	linux/compat/ip_gre.c \
 	linux/compat/ip_fragment.c \
+	linux/compat/ip_output.c \
 	linux/compat/ip_tunnel.c \
 	linux/compat/ip_tunnels_core.c \
 	linux/compat/ip6_output.c \
@@ -65,9 +67,11 @@ openvswitch_headers += \
 	linux/compat/include/linux/stddef.h \
 	linux/compat/include/linux/types.h \
 	linux/compat/include/linux/u64_stats_sync.h \
+	linux/compat/include/linux/udp.h \
 	linux/compat/include/linux/workqueue.h \
 	linux/compat/include/net/checksum.h \
 	linux/compat/include/net/dst.h \
+	linux/compat/include/net/dst_cache.h \
 	linux/compat/include/net/dst_metadata.h \
 	linux/compat/include/net/flow_keys.h \
 	linux/compat/include/net/genetlink.h \
@@ -78,6 +82,7 @@ openvswitch_headers += \
 	linux/compat/include/net/inetpeer.h \
 	linux/compat/include/net/ip.h \
 	linux/compat/include/net/ip_tunnels.h \
+	linux/compat/include/net/ip6_fib.h \
 	linux/compat/include/net/ip6_route.h \
 	linux/compat/include/net/ip6_tunnel.h \
 	linux/compat/include/net/ipv6.h \

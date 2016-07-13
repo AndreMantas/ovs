@@ -442,8 +442,10 @@ struct dp_netdev_pmd_thread {
     pthread_t thread;
     unsigned core_id;               /* CPU core id of this pmd thread. */
     int numa_id;                    /* numa node id of this pmd thread. */
-    atomic_int tx_qid;              /* Queue id used by this pmd thread to
-                                     * send packets on all netdevs */
+
+    /* Queue id used by this pmd thread to send packets on all netdevs.
+     * All tx_qid's are unique and less than 'ovs_numa_get_n_cores() + 1'. */
+    atomic_int tx_qid;
 
     struct ovs_mutex port_mutex;    /* Mutex for 'poll_list' and 'tx_ports'. */
     /* List of rx queues to poll. */
@@ -2531,7 +2533,7 @@ dpif_netdev_pmd_set(struct dpif *dpif, const char *cmask)
 
     if (!cmask_equals(dp->requested_pmd_cmask, cmask)) {
         free(dp->requested_pmd_cmask);
-        dp->requested_pmd_cmask = cmask ? xstrdup(cmask) : NULL;
+        dp->requested_pmd_cmask = nullable_xstrdup(cmask);
     }
 
     return 0;
@@ -2690,9 +2692,7 @@ reconfigure_pmd_threads(struct dp_netdev *dp)
     /* Reconfigures the cpu mask. */
     ovs_numa_set_cpu_mask(dp->requested_pmd_cmask);
     free(dp->pmd_cmask);
-    dp->pmd_cmask = dp->requested_pmd_cmask
-                    ? xstrdup(dp->requested_pmd_cmask)
-                    : NULL;
+    dp->pmd_cmask = nullable_xstrdup(dp->requested_pmd_cmask);
 
     /* Restores the non-pmd. */
     dp_netdev_set_nonpmd(dp);
@@ -2844,7 +2844,6 @@ pmd_thread_main(void *f_)
     int poll_cnt;
     int i;
 
-    poll_cnt = 0;
     poll_list = NULL;
 
     /* Stores the pmd thread's 'pmd' to 'per_pmd_key'. */
@@ -2872,9 +2871,10 @@ reload:
 
             lc = 0;
 
-            emc_cache_slow_sweep(&pmd->flow_cache);
             coverage_try_clear();
-            ovsrcu_quiesce();
+            if (!ovsrcu_try_quiesce()) {
+                emc_cache_slow_sweep(&pmd->flow_cache);
+            }
 
             atomic_read_relaxed(&pmd->change_seq, &seq);
             if (seq != port_seq) {
@@ -4057,12 +4057,16 @@ dp_execute_cb(void *aux_, struct dp_packet_batch *packets_,
     case OVS_ACTION_ATTR_TUNNEL_PUSH:
         if (*depth < MAX_RECIRC_DEPTH) {
             struct dp_packet_batch tnl_pkt;
+            struct dp_packet_batch *orig_packets_ = packets_;
             int err;
 
             if (!may_steal) {
                 dp_packet_batch_clone(&tnl_pkt, packets_);
                 packets_ = &tnl_pkt;
+                dp_packet_batch_reset_cutlen(orig_packets_);
             }
+
+            dp_packet_batch_apply_cutlen(packets_);
 
             err = push_tnl_action(pmd, a, packets_);
             if (!err) {
@@ -4076,6 +4080,7 @@ dp_execute_cb(void *aux_, struct dp_packet_batch *packets_,
 
     case OVS_ACTION_ATTR_TUNNEL_POP:
         if (*depth < MAX_RECIRC_DEPTH) {
+            struct dp_packet_batch *orig_packets_ = packets_;
             odp_port_t portno = u32_to_odp(nl_attr_get_u32(a));
 
             p = pmd_tx_port_cache_lookup(pmd, portno);
@@ -4084,9 +4089,12 @@ dp_execute_cb(void *aux_, struct dp_packet_batch *packets_,
                 int i;
 
                 if (!may_steal) {
-                   dp_packet_batch_clone(&tnl_pkt, packets_);
-                   packets_ = &tnl_pkt;
+                    dp_packet_batch_clone(&tnl_pkt, packets_);
+                    packets_ = &tnl_pkt;
+                    dp_packet_batch_reset_cutlen(orig_packets_);
                 }
+
+                dp_packet_batch_apply_cutlen(packets_);
 
                 netdev_pop_header(p->netdev, packets_);
                 if (!packets_->count) {
@@ -4107,15 +4115,30 @@ dp_execute_cb(void *aux_, struct dp_packet_batch *packets_,
 
     case OVS_ACTION_ATTR_USERSPACE:
         if (!fat_rwlock_tryrdlock(&dp->upcall_rwlock)) {
+            struct dp_packet_batch *orig_packets_ = packets_;
             struct dp_packet **packets = packets_->packets;
             const struct nlattr *userdata;
+            struct dp_packet_batch usr_pkt;
             struct ofpbuf actions;
             struct flow flow;
             ovs_u128 ufid;
+            bool clone = false;
             int i;
 
             userdata = nl_attr_find_nested(a, OVS_USERSPACE_ATTR_USERDATA);
             ofpbuf_init(&actions, 0);
+
+            if (packets_->trunc) {
+                if (!may_steal) {
+                    dp_packet_batch_clone(&usr_pkt, packets_);
+                    packets_ = &usr_pkt;
+                    packets = packets_->packets;
+                    clone = true;
+                    dp_packet_batch_reset_cutlen(orig_packets_);
+                }
+
+                dp_packet_batch_apply_cutlen(packets_);
+            }
 
             for (i = 0; i < packets_->count; i++) {
                 flow_extract(packets[i], &flow);
@@ -4123,6 +4146,11 @@ dp_execute_cb(void *aux_, struct dp_packet_batch *packets_,
                 dp_execute_userspace_action(pmd, packets[i], may_steal, &flow,
                                             &ufid, &actions, userdata);
             }
+
+            if (clone) {
+                dp_packet_delete_batch(packets_, true);
+            }
+
             ofpbuf_uninit(&actions);
             fat_rwlock_unlock(&dp->upcall_rwlock);
 
@@ -4170,6 +4198,7 @@ dp_execute_cb(void *aux_, struct dp_packet_batch *packets_,
     case OVS_ACTION_ATTR_SAMPLE:
     case OVS_ACTION_ATTR_HASH:
     case OVS_ACTION_ATTR_UNSPEC:
+    case OVS_ACTION_ATTR_TRUNC:
     case __OVS_ACTION_ATTR_MAX:
         OVS_NOT_REACHED();
     }

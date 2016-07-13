@@ -1212,6 +1212,63 @@ check_masked_set_action(struct dpif_backer *backer)
     return !error;
 }
 
+/* Tests whether 'backer''s datapath supports truncation of a packet in
+ * OVS_ACTION_ATTR_TRUNC.  We need to disable some features on older
+ * datapaths that don't support this feature. */
+static bool
+check_trunc_action(struct dpif_backer *backer)
+{
+    struct eth_header *eth;
+    struct ofpbuf actions;
+    struct dpif_execute execute;
+    struct dp_packet packet;
+    struct ovs_action_trunc *trunc;
+    struct flow flow;
+    int error;
+
+    /* Compose an action with output(port:1,
+     *              max_len:OVS_ACTION_OUTPUT_MIN + 1).
+     * This translates to one truncate action and one output action. */
+    ofpbuf_init(&actions, 64);
+    trunc = nl_msg_put_unspec_uninit(&actions,
+                            OVS_ACTION_ATTR_TRUNC, sizeof *trunc);
+
+    trunc->max_len = ETH_HEADER_LEN + 1;
+    nl_msg_put_odp_port(&actions, OVS_ACTION_ATTR_OUTPUT, u32_to_odp(1));
+
+    /* Compose a dummy Ethernet packet. */
+    dp_packet_init(&packet, ETH_HEADER_LEN);
+    eth = dp_packet_put_zeros(&packet, ETH_HEADER_LEN);
+    eth->eth_type = htons(0x1234);
+
+    flow_extract(&packet, &flow);
+
+    /* Execute the actions.  On older datapaths this fails with EINVAL, on
+     * newer datapaths it succeeds. */
+    execute.actions = actions.data;
+    execute.actions_len = actions.size;
+    execute.packet = &packet;
+    execute.flow = &flow;
+    execute.needs_help = false;
+    execute.probe = true;
+    execute.mtu = 0;
+
+    error = dpif_execute(backer->dpif, &execute);
+
+    dp_packet_uninit(&packet);
+    ofpbuf_uninit(&actions);
+
+    if (error) {
+        VLOG_INFO("%s: Datapath does not support truncate action",
+                  dpif_name(backer->dpif));
+    } else {
+        VLOG_INFO("%s: Datapath supports truncate action",
+                  dpif_name(backer->dpif));
+    }
+
+    return !error;
+}
+
 #define CHECK_FEATURE__(NAME, SUPPORT, FIELD, VALUE)                        \
 static bool                                                                 \
 check_##NAME(struct dpif_backer *backer)                                    \
@@ -1263,6 +1320,7 @@ check_support(struct dpif_backer *backer)
     backer->support.odp.recirc = check_recirc(backer);
     backer->support.odp.max_mpls_depth = check_max_mpls_depth(backer);
     backer->support.masked_set_action = check_masked_set_action(backer);
+    backer->support.trunc = check_trunc_action(backer);
     backer->support.ufid = check_ufid(backer);
     backer->support.tnl_push_pop = dpif_supports_tnl_push_pop(backer->dpif);
 
@@ -2161,7 +2219,7 @@ rstp_send_bpdu_cb(struct dp_packet *pkt, void *ofport_, void *ofproto_)
                      "does not have a configured source MAC address.",
                      ofproto->up.name, ofp_to_u16(ofport->up.ofp_port));
     } else {
-        ofproto_dpif_send_packet(ofport, pkt);
+        ofproto_dpif_send_packet(ofport, false, pkt);
     }
     dp_packet_delete(pkt);
 }
@@ -2185,7 +2243,7 @@ send_bpdu_cb(struct dp_packet *pkt, int port_num, void *ofproto_)
             VLOG_WARN_RL(&rl, "%s: cannot send BPDU on port %d "
                          "with unknown MAC", ofproto->up.name, port_num);
         } else {
-            ofproto_dpif_send_packet(ofport, pkt);
+            ofproto_dpif_send_packet(ofport, false, pkt);
         }
     }
     dp_packet_delete(pkt);
@@ -3035,7 +3093,7 @@ send_pdu_cb(void *port_, const void *pdu, size_t pdu_size)
                                  pdu_size);
         memcpy(packet_pdu, pdu, pdu_size);
 
-        ofproto_dpif_send_packet(port, &packet);
+        ofproto_dpif_send_packet(port, false, &packet);
         dp_packet_uninit(&packet);
     } else {
         VLOG_ERR_RL(&rl, "port %s: cannot obtain Ethernet address of iface "
@@ -3074,7 +3132,7 @@ bundle_send_learning_packets(struct ofbundle *bundle)
     LIST_FOR_EACH_POP (pkt_node, list_node, &packets) {
         int ret;
 
-        ret = ofproto_dpif_send_packet(pkt_node->port, pkt_node->pkt);
+        ret = ofproto_dpif_send_packet(pkt_node->port, false, pkt_node->pkt);
         dp_packet_delete(pkt_node->pkt);
         free(pkt_node);
         if (ret) {
@@ -3158,7 +3216,8 @@ mirror_set__(struct ofproto *ofproto_, void *aux,
 
     error = mirror_set(ofproto->mbridge, aux, s->name, srcs, s->n_srcs, dsts,
                        s->n_dsts, s->src_vlans,
-                       bundle_lookup(ofproto, s->out_bundle), s->out_vlan);
+                       bundle_lookup(ofproto, s->out_bundle),
+                       s->snaplen, s->out_vlan);
     free(srcs);
     free(dsts);
     return error;
@@ -4324,16 +4383,18 @@ group_dpif_get_selection_method(const struct group_dpif *group)
     return group->up.props.selection_method;
 }
 
-/* Sends 'packet' out 'ofport'.
+/* Sends 'packet' out 'ofport'. If 'port' is a tunnel and that tunnel type
+ * supports a notion of an OAM flag, sets it if 'oam' is true.
  * May modify 'packet'.
  * Returns 0 if successful, otherwise a positive errno value. */
 int
-ofproto_dpif_send_packet(const struct ofport_dpif *ofport, struct dp_packet *packet)
+ofproto_dpif_send_packet(const struct ofport_dpif *ofport, bool oam,
+                         struct dp_packet *packet)
 {
     struct ofproto_dpif *ofproto = ofproto_dpif_cast(ofport->up.ofproto);
     int error;
 
-    error = xlate_send_packet(ofport, packet);
+    error = xlate_send_packet(ofport, oam, packet);
 
     ovs_mutex_lock(&ofproto->stats_mutex);
     ofproto->stats.tx_packets++;
@@ -5343,6 +5404,24 @@ disable_tnl_push_pop(struct unixctl_conn *conn OVS_UNUSED, int argc OVS_UNUSED,
 }
 
 static void
+disable_datapath_truncate(struct unixctl_conn *conn OVS_UNUSED,
+                          int argc OVS_UNUSED,
+                          const char *argv[] OVS_UNUSED,
+                          void *aux OVS_UNUSED)
+{
+    const struct shash_node **backers;
+    int i;
+
+    backers = shash_sort(&all_dpif_backers);
+    for (i = 0; i < shash_count(&all_dpif_backers); i++) {
+        struct dpif_backer *backer = backers[i]->data;
+        backer->support.trunc = false;
+    }
+    free(backers);
+    unixctl_command_reply(conn, "Datapath truncate action diabled");
+}
+
+static void
 ofproto_unixctl_init(void)
 {
     static bool registered;
@@ -5376,6 +5455,9 @@ ofproto_unixctl_init(void)
 
     unixctl_command_register("ofproto/tnl-push-pop", "[on]|[off]", 1, 1,
                              disable_tnl_push_pop, NULL);
+
+    unixctl_command_register("dpif/disable-truncate", "", 0, 0,
+                             disable_datapath_truncate, NULL);
 }
 
 /* Returns true if 'table' is the table used for internal rules,

@@ -418,6 +418,7 @@ static const struct tc_ops tc_ops_codel;
 static const struct tc_ops tc_ops_fqcodel;
 static const struct tc_ops tc_ops_sfq;
 static const struct tc_ops tc_ops_default;
+static const struct tc_ops tc_ops_noop;
 static const struct tc_ops tc_ops_other;
 
 static const struct tc_ops *const tcs[] = {
@@ -426,6 +427,7 @@ static const struct tc_ops *const tcs[] = {
     &tc_ops_codel,              /* Controlled delay */
     &tc_ops_fqcodel,            /* Fair queue controlled delay */
     &tc_ops_sfq,                /* Stochastic fair queueing */
+    &tc_ops_noop,               /* Non operating qos type. */
     &tc_ops_default,            /* Default qdisc (see tc-pfifo_fast(8)). */
     &tc_ops_other,              /* Some other qdisc. */
     NULL
@@ -1170,6 +1172,9 @@ netdev_linux_send(struct netdev *netdev_, int qid OVS_UNUSED,
         size_t size = dp_packet_size(pkts[i]);
         ssize_t retval;
 
+        /* Truncate the packet if it is configured. */
+        size -= dp_packet_get_cutlen(pkts[i]);
+
         if (!is_tap_netdev(netdev_)) {
             /* Use our AF_PACKET socket to send to this device. */
             struct sockaddr_ll sll;
@@ -1218,15 +1223,20 @@ netdev_linux_send(struct netdev *netdev_, int qid OVS_UNUSED,
         }
 
         if (retval < 0) {
-            /* The Linux AF_PACKET implementation never blocks waiting for room
-             * for packets, instead returning ENOBUFS.  Translate this into
-             * EAGAIN for the caller. */
-            error = errno == ENOBUFS ? EAGAIN : errno;
-            if (error == EINTR) {
-                /* continue without incrementing 'i', i.e. retry this packet */
+            if (errno == EINTR) {
+                /* The send was interrupted by a signal.  Retry the packet by
+                 * continuing without incrementing 'i'.*/
                 continue;
+            } else if (errno == EIO && is_tap_netdev(netdev_)) {
+                /* The Linux tap driver returns EIO if the device is not up.
+                 * From the OVS side this is not an error, so ignore it. */
+            } else {
+                /* The Linux AF_PACKET implementation never blocks waiting for
+                 * room for packets, instead returning ENOBUFS.  Translate this
+                 * into EAGAIN for the caller. */
+                error = errno == ENOBUFS ? EAGAIN : errno;
+                break;
             }
-            break;
         } else if (retval != size) {
             VLOG_WARN_RL(&rl, "sent partial Ethernet packet (%"PRIuSIZE" bytes"
                               " of %"PRIuSIZE") on %s", retval, size,
@@ -2101,7 +2111,6 @@ netdev_linux_get_qos_types(const struct netdev *netdev OVS_UNUSED,
                            struct sset *types)
 {
     const struct tc_ops *const *opsp;
-
     for (opsp = tcs; *opsp != NULL; opsp++) {
         const struct tc_ops *ops = *opsp;
         if (ops->tc_install && ops->ovs_name[0] != '\0') {
@@ -2204,6 +2213,10 @@ netdev_linux_set_qos(struct netdev *netdev_,
     new_ops = tc_lookup_ovs_name(type);
     if (!new_ops || !new_ops->tc_install) {
         return EOPNOTSUPP;
+    }
+
+    if (new_ops == &tc_ops_noop) {
+        return new_ops->tc_install(netdev_, details);
     }
 
     ovs_mutex_lock(&netdev->mutex);
@@ -4487,6 +4500,48 @@ static const struct tc_ops tc_ops_hfsc = {
     hfsc_class_delete,          /* class_delete */
     hfsc_class_get_stats,       /* class_get_stats */
     hfsc_class_dump_stats       /* class_dump_stats */
+};
+
+/* "linux-noop" traffic control class. */
+
+static void
+noop_install__(struct netdev *netdev_)
+{
+    struct netdev_linux *netdev = netdev_linux_cast(netdev_);
+    static const struct tc tc = TC_INITIALIZER(&tc, &tc_ops_default);
+
+    netdev->tc = CONST_CAST(struct tc *, &tc);
+}
+
+static int
+noop_tc_install(struct netdev *netdev,
+                   const struct smap *details OVS_UNUSED)
+{
+    noop_install__(netdev);
+    return 0;
+}
+
+static int
+noop_tc_load(struct netdev *netdev, struct ofpbuf *nlmsg OVS_UNUSED)
+{
+    noop_install__(netdev);
+    return 0;
+}
+
+static const struct tc_ops tc_ops_noop = {
+    NULL,                       /* linux_name */
+    "linux-noop",               /* ovs_name */
+    0,                          /* n_queues */
+    noop_tc_install,
+    noop_tc_load,
+    NULL,                       /* tc_destroy */
+    NULL,                       /* qdisc_get */
+    NULL,                       /* qdisc_set */
+    NULL,                       /* class_get */
+    NULL,                       /* class_set */
+    NULL,                       /* class_delete */
+    NULL,                       /* class_get_stats */
+    NULL                        /* class_dump_stats */
 };
 
 /* "linux-default" traffic control class.

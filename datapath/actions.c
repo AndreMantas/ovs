@@ -681,8 +681,8 @@ static void prepare_frag(struct vport *vport, struct sk_buff *skb)
 	skb_pull(skb, hlen);
 }
 
-static void ovs_fragment(struct vport *vport, struct sk_buff *skb, u16 mru,
-			 __be16 ethertype)
+static void ovs_fragment(struct net *net, struct vport *vport,
+			 struct sk_buff *skb, u16 mru, __be16 ethertype)
 {
 	if (skb_network_offset(skb) > MAX_L2_LEN) {
 		OVS_NLERR(1, "L2 header too long to fragment");
@@ -702,7 +702,7 @@ static void ovs_fragment(struct vport *vport, struct sk_buff *skb, u16 mru,
 		skb_dst_set_noref(skb, &ovs_dst);
 		IPCB(skb)->frag_max_size = mru;
 
-		ip_do_fragment(skb->sk, skb, ovs_vport_output);
+		ip_do_fragment(net, skb->sk, skb, ovs_vport_output);
 		refdst_drop(orig_dst);
 	} else if (ethertype == htons(ETH_P_IPV6)) {
 		const struct nf_ipv6_ops *v6ops = nf_get_ipv6_ops();
@@ -744,10 +744,19 @@ static void do_output(struct datapath *dp, struct sk_buff *skb, int out_port,
 
 	if (likely(vport)) {
 		u16 mru = OVS_CB(skb)->mru;
+		u32 cutlen = OVS_CB(skb)->cutlen;
+
+		if (unlikely(cutlen > 0)) {
+			if (skb->len - cutlen > ETH_HLEN)
+				pskb_trim(skb, skb->len - cutlen);
+			else
+				pskb_trim(skb, ETH_HLEN);
+		}
 
 		if (likely(!mru || (skb->len <= mru + ETH_HLEN))) {
 			ovs_vport_send(vport, skb);
 		} else if (mru <= vport->dev->mtu) {
+			struct net *net = ovs_dp_get_net(dp);
 			__be16 ethertype = key->eth.type;
 
 			if (!is_flow_key_valid(key)) {
@@ -757,7 +766,7 @@ static void do_output(struct datapath *dp, struct sk_buff *skb, int out_port,
 					ethertype = vlan_get_protocol(skb);
 			}
 
-			ovs_fragment(vport, skb, mru, ethertype);
+			ovs_fragment(net, vport, skb, mru, ethertype);
 		} else {
 			OVS_NLERR(true, "Cannot fragment IP frames");
 			kfree_skb(skb);
@@ -766,19 +775,21 @@ static void do_output(struct datapath *dp, struct sk_buff *skb, int out_port,
 		kfree_skb(skb);
 	}
 }
+
 static int output_userspace(struct datapath *dp, struct sk_buff *skb,
 			    struct sw_flow_key *key, const struct nlattr *attr,
-			    const struct nlattr *actions, int actions_len)
+			    const struct nlattr *actions, int actions_len,
+			    uint32_t cutlen)
 {
-	struct ip_tunnel_info info;
 	struct dp_upcall_info upcall;
 	const struct nlattr *a;
-	int rem;
+	int rem, err;
 
 	memset(&upcall, 0, sizeof(upcall));
 	upcall.cmd = OVS_PACKET_CMD_ACTION;
 	upcall.mru = OVS_CB(skb)->mru;
 
+	SKB_INIT_FILL_METADATA_DST(skb);
 	for (a = nla_data(attr), rem = nla_len(attr); rem > 0;
 		 a = nla_next(a, &rem)) {
 		switch (nla_type(a)) {
@@ -798,11 +809,9 @@ static int output_userspace(struct datapath *dp, struct sk_buff *skb,
 			if (vport) {
 				int err;
 
-				upcall.egress_tun_info = &info;
-				err = ovs_vport_get_egress_tun_info(vport, skb,
-								    &upcall);
-				if (err)
-					upcall.egress_tun_info = NULL;
+				err = dev_fill_metadata_dst(vport->dev, skb);
+				if (!err)
+					upcall.egress_tun_info = skb_tunnel_info(skb);
 			}
 
 			break;
@@ -818,7 +827,9 @@ static int output_userspace(struct datapath *dp, struct sk_buff *skb,
 		} /* End of switch. */
 	}
 
-	return ovs_dp_upcall(dp, skb, key, &upcall);
+	err = ovs_dp_upcall(dp, skb, key, &upcall, cutlen);
+	SKB_RESTORE_FILL_METADATA_DST(skb);
+	return err;
 }
 
 static int sample(struct datapath *dp, struct sk_buff *skb,
@@ -828,6 +839,7 @@ static int sample(struct datapath *dp, struct sk_buff *skb,
 	const struct nlattr *acts_list = NULL;
 	const struct nlattr *a;
 	int rem;
+	u32 cutlen = 0;
 
 	for (a = nla_data(attr), rem = nla_len(attr); rem > 0;
 		 a = nla_next(a, &rem)) {
@@ -854,13 +866,24 @@ static int sample(struct datapath *dp, struct sk_buff *skb,
 		return 0;
 
 	/* The only known usage of sample action is having a single user-space
+	 * action, or having a truncate action followed by a single user-space
 	 * action. Treat this usage as a special case.
 	 * The output_userspace() should clone the skb to be sent to the
 	 * user space. This skb will be consumed by its caller.
 	 */
+	if (unlikely(nla_type(a) == OVS_ACTION_ATTR_TRUNC)) {
+		struct ovs_action_trunc *trunc = nla_data(a);
+
+		if (skb->len > trunc->max_len)
+			cutlen = skb->len - trunc->max_len;
+
+		a = nla_next(a, &rem);
+	}
+
 	if (likely(nla_type(a) == OVS_ACTION_ATTR_USERSPACE &&
 		   nla_is_last(a, rem)))
-		return output_userspace(dp, skb, key, a, actions, actions_len);
+		return output_userspace(dp, skb, key, a, actions,
+					actions_len, cutlen);
 
 	skb = skb_clone(skb, GFP_ATOMIC);
 	if (!skb)
@@ -1047,6 +1070,7 @@ static int do_execute_actions(struct datapath *dp, struct sk_buff *skb,
 			if (out_skb)
 				do_output(dp, out_skb, prev_port, key);
 
+			OVS_CB(skb)->cutlen = 0;
 			prev_port = -1;
 		}
 
@@ -1055,8 +1079,18 @@ static int do_execute_actions(struct datapath *dp, struct sk_buff *skb,
 			prev_port = nla_get_u32(a);
 			break;
 
+		case OVS_ACTION_ATTR_TRUNC: {
+			struct ovs_action_trunc *trunc = nla_data(a);
+
+			if (skb->len > trunc->max_len)
+				OVS_CB(skb)->cutlen = skb->len - trunc->max_len;
+			break;
+		}
+
 		case OVS_ACTION_ATTR_USERSPACE:
-			output_userspace(dp, skb, key, a, attr, len);
+			output_userspace(dp, skb, key, a, attr,
+						     len, OVS_CB(skb)->cutlen);
+			OVS_CB(skb)->cutlen = 0;
 			break;
 
 		case OVS_ACTION_ATTR_HASH:

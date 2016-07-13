@@ -16,18 +16,15 @@ static inline void ip6tunnel_xmit(struct sock *sk, struct sk_buff *skb,
 	int pkt_len, err;
 
 	pkt_len = skb->len - skb_inner_network_offset(skb);
-	/* TODO: Fix GSO for ipv6 */
 #ifdef HAVE_IP6_LOCAL_OUT_SK
 	err = ip6_local_out_sk(sk, skb);
 #else
 	err = ip6_local_out(skb);
 #endif
-	if (net_xmit_eval(err) != 0)
-		pkt_len = net_xmit_eval(err);
-	else
-		pkt_len = err;
+	if (net_xmit_eval(err))
+		pkt_len = -1;
 
-	iptunnel_xmit_stats(pkt_len, &dev->stats, (struct pcpu_sw_netstats __percpu *)dev->tstats);
+	iptunnel_xmit_stats(dev, pkt_len);
 }
 
 #endif

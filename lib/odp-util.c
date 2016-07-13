@@ -107,6 +107,7 @@ odp_action_len(uint16_t type)
 
     switch ((enum ovs_action_attr) type) {
     case OVS_ACTION_ATTR_OUTPUT: return sizeof(uint32_t);
+    case OVS_ACTION_ATTR_TRUNC: return sizeof(struct ovs_action_trunc);
     case OVS_ACTION_ATTR_TUNNEL_PUSH: return ATTR_LEN_VARIABLE;
     case OVS_ACTION_ATTR_TUNNEL_POP: return sizeof(uint32_t);
     case OVS_ACTION_ATTR_USERSPACE: return ATTR_LEN_VARIABLE;
@@ -777,6 +778,14 @@ format_odp_action(struct ds *ds, const struct nlattr *a)
     case OVS_ACTION_ATTR_OUTPUT:
         ds_put_format(ds, "%"PRIu32, nl_attr_get_u32(a));
         break;
+    case OVS_ACTION_ATTR_TRUNC: {
+        const struct ovs_action_trunc *trunc =
+                       nl_attr_get_unspec(a, sizeof *trunc);
+
+        ds_put_format(ds, "trunc(%"PRIu32")", trunc->max_len);
+        break;
+    }
+    break;
     case OVS_ACTION_ATTR_TUNNEL_POP:
         ds_put_format(ds, "tnl_pop(%"PRIu32")", nl_attr_get_u32(a));
         break;
@@ -1524,6 +1533,20 @@ parse_odp_action(const char *s, const struct simap *port_names,
 
         if (ovs_scan(s, "%"SCNi32"%n", &port, &n)) {
             nl_msg_put_u32(actions, OVS_ACTION_ATTR_OUTPUT, port);
+            return n;
+        }
+    }
+
+    {
+        uint32_t max_len;
+        int n;
+
+        if (ovs_scan(s, "trunc(%"SCNi32")%n", &max_len, &n)) {
+            struct ovs_action_trunc *trunc;
+
+            trunc = nl_msg_put_unspec_uninit(actions,
+                     OVS_ACTION_ATTR_TRUNC, sizeof *trunc);
+            trunc->max_len = max_len;
             return n;
         }
     }
@@ -2968,6 +2991,12 @@ format_u128(struct ds *ds, const ovs_u128 *key, const ovs_u128 *mask,
     }
 }
 
+/* Read the string from 's_' as a 128-bit value.  If the string contains
+ * a "/", the rest of the string will be treated as a 128-bit mask.
+ *
+ * If either the value or mask is larger than 64 bits, the string must
+ * be in hexadecimal.
+ */
 static int
 scan_u128(const char *s_, ovs_u128 *value, ovs_u128 *mask)
 {
@@ -4397,9 +4426,7 @@ odp_flow_key_from_flow__(const struct odp_flow_key_parms *parms,
             icmpv6_key->icmpv6_type = ntohs(data->tp_src);
             icmpv6_key->icmpv6_code = ntohs(data->tp_dst);
 
-            if (flow->tp_dst == htons(0)
-                && (flow->tp_src == htons(ND_NEIGHBOR_SOLICIT)
-                    || flow->tp_src == htons(ND_NEIGHBOR_ADVERT))
+            if (is_nd(flow, NULL)
                 /* Even though 'tp_src' and 'tp_dst' are 16 bits wide, ICMP
                  * type and code are 8 bits wide.  Therefore, an exact match
                  * looks like htons(0xff), not htons(0xffff).  See
@@ -4934,9 +4961,7 @@ parse_l2_5_onward(const struct nlattr *attrs[OVS_KEY_ATTR_MAX + 1],
             flow->tp_src = htons(icmpv6_key->icmpv6_type);
             flow->tp_dst = htons(icmpv6_key->icmpv6_code);
             expected_bit = OVS_KEY_ATTR_ICMPV6;
-            if (src_flow->tp_dst == htons(0) &&
-                (src_flow->tp_src == htons(ND_NEIGHBOR_SOLICIT) ||
-                 src_flow->tp_src == htons(ND_NEIGHBOR_ADVERT))) {
+            if (is_nd(src_flow, NULL)) {
                 if (!is_mask) {
                     expected_attrs |= UINT64_C(1) << OVS_KEY_ATTR_ND;
                 }

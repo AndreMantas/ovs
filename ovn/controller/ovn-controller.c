@@ -39,6 +39,7 @@
 #include "ofctrl.h"
 #include "openvswitch/vconn.h"
 #include "openvswitch/vlog.h"
+#include "ovn/lib/actions.h"
 #include "ovn/lib/ovn-sb-idl.h"
 #include "ovn/lib/ovn-util.h"
 #include "patch.h"
@@ -60,7 +61,9 @@ static unixctl_cb_func ovn_controller_exit;
 static unixctl_cb_func ct_zone_list;
 
 #define DEFAULT_BRIDGE_NAME "br-int"
+#define DEFAULT_PROBE_INTERVAL_MSEC 5000
 
+static void update_probe_interval(struct controller_ctx *);
 static void parse_options(int argc, char *argv[]);
 OVS_NO_RETURN static void usage(void);
 
@@ -228,32 +231,6 @@ get_ovnsb_remote(struct ovsdb_idl *ovs_idl)
     }
 }
 
-/* Retrieves the OVN Southbound remote's json session probe interval from the
- * "external-ids:ovn-remote-probe-interval" key in 'ovs_idl' and returns it.
- *
- * This function must be called after get_ovnsb_remote(). */
-static bool
-get_ovnsb_remote_probe_interval(struct ovsdb_idl *ovs_idl, int *value)
-{
-    const struct ovsrec_open_vswitch *cfg = ovsrec_open_vswitch_first(ovs_idl);
-    if (!cfg) {
-        return false;
-    }
-
-    const char *probe_interval =
-        smap_get(&cfg->external_ids, "ovn-remote-probe-interval");
-    if (probe_interval) {
-        if (str_to_int(probe_interval, 10, value)) {
-            return true;
-        }
-
-        VLOG_WARN("Invalid value for OVN remote probe interval: %s",
-                  probe_interval);
-    }
-
-    return false;
-}
-
 static void
 update_ct_zones(struct sset *lports, struct hmap *patched_datapaths,
                 struct simap *ct_zones, unsigned long *ct_zone_bitmap)
@@ -274,8 +251,8 @@ update_ct_zones(struct sset *lports, struct hmap *patched_datapaths,
             continue;
         }
 
-        char *dnat = alloc_nat_zone_key(pd->port_binding, "dnat");
-        char *snat = alloc_nat_zone_key(pd->port_binding, "snat");
+        char *dnat = alloc_nat_zone_key(pd->key, "dnat");
+        char *snat = alloc_nat_zone_key(pd->key, "snat");
         sset_add(&all_users, dnat);
         sset_add(&all_users, snat);
         free(dnat);
@@ -322,6 +299,14 @@ update_ct_zones(struct sset *lports, struct hmap *patched_datapaths,
     sset_destroy(&all_users);
 }
 
+/* Contains "struct local_datapath" nodes whose hash values are the
+ * tunnel_key of datapaths with at least one local port binding. */
+static struct hmap local_datapaths = HMAP_INITIALIZER(&local_datapaths);
+static struct hmap patched_datapaths = HMAP_INITIALIZER(&patched_datapaths);
+
+static struct lport_index lports;
+static struct mcgroup_index mcgroups;
+
 int
 main(int argc, char *argv[])
 {
@@ -343,6 +328,13 @@ main(int argc, char *argv[])
     }
     unixctl_command_register("exit", "", 0, 0, ovn_controller_exit, &exiting);
 
+    /* Initialize group ids for loadbalancing. */
+    struct group_table group_table;
+    group_table.group_ids = bitmap_allocate(MAX_OVN_GROUPS);
+    bitmap_set1(group_table.group_ids, 0); /* Group id 0 is invalid. */
+    hmap_init(&group_table.desired_groups);
+    hmap_init(&group_table.existing_groups);
+
     daemonize_complete();
 
     ovsrec_init();
@@ -351,6 +343,9 @@ main(int argc, char *argv[])
     ofctrl_init();
     pinctrl_init();
     lflow_init();
+
+    lport_index_init(&lports);
+    mcgroup_index_init(&mcgroups);
 
     /* Connect to OVS OVSDB instance.  We do not monitor all tables by
      * default, so modules must register their interest explicitly.  */
@@ -383,12 +378,11 @@ main(int argc, char *argv[])
     char *ovnsb_remote = get_ovnsb_remote(ovs_idl_loop.idl);
     struct ovsdb_idl_loop ovnsb_idl_loop = OVSDB_IDL_LOOP_INITIALIZER(
         ovsdb_idl_create(ovnsb_remote, &sbrec_idl_class, true, true));
-    ovsdb_idl_get_initial_snapshot(ovnsb_idl_loop.idl);
 
-    int probe_interval = 0;
-    if (get_ovnsb_remote_probe_interval(ovs_idl_loop.idl, &probe_interval)) {
-        ovsdb_idl_set_probe_interval(ovnsb_idl_loop.idl, probe_interval);
-    }
+    /* Track the southbound idl. */
+    ovsdb_idl_track_add_all(ovnsb_idl_loop.idl);
+
+    ovsdb_idl_get_initial_snapshot(ovnsb_idl_loop.idl);
 
     /* Initialize connection tracking zones. */
     struct simap ct_zones = SIMAP_INITIALIZER(&ct_zones);
@@ -407,6 +401,9 @@ main(int argc, char *argv[])
             free(ovnsb_remote);
             ovnsb_remote = new_ovnsb_remote;
             ovsdb_idl_set_remote(ovnsb_idl_loop.idl, ovnsb_remote, true);
+            binding_reset_processing();
+            lport_index_clear(&lports);
+            mcgroup_index_clear(&mcgroups);
         } else {
             free(new_ovnsb_remote);
         }
@@ -418,11 +415,8 @@ main(int argc, char *argv[])
             .ovnsb_idl_txn = ovsdb_idl_loop_run(&ovnsb_idl_loop),
         };
 
-        /* Contains "struct local_datpath" nodes whose hash values are the
-         * tunnel_key of datapaths with at least one local port binding. */
-        struct hmap local_datapaths = HMAP_INITIALIZER(&local_datapaths);
+        update_probe_interval(&ctx);
 
-        struct hmap patched_datapaths = HMAP_INITIALIZER(&patched_datapaths);
         struct sset all_lports = SSET_INITIALIZER(&all_lports);
 
         const struct ovsrec_bridge *br_int = get_br_int(&ctx);
@@ -431,18 +425,15 @@ main(int argc, char *argv[])
         if (chassis_id) {
             chassis_run(&ctx, chassis_id);
             encaps_run(&ctx, br_int, chassis_id);
-            binding_run(&ctx, br_int, chassis_id, &all_lports,
-                        &local_datapaths);
+            binding_run(&ctx, br_int, chassis_id, &local_datapaths);
         }
 
         if (br_int && chassis_id) {
             patch_run(&ctx, br_int, chassis_id, &local_datapaths,
                       &patched_datapaths);
 
-            struct lport_index lports;
-            struct mcgroup_index mcgroups;
-            lport_index_init(&lports, ctx.ovnsb_idl);
-            mcgroup_index_init(&mcgroups, ctx.ovnsb_idl);
+            lport_index_fill(&lports, ctx.ovnsb_idl);
+            mcgroup_index_fill(&mcgroups, ctx.ovnsb_idl);
 
             enum mf_field_id mff_ovn_geneve = ofctrl_run(br_int);
 
@@ -452,34 +443,18 @@ main(int argc, char *argv[])
 
             struct hmap flow_table = HMAP_INITIALIZER(&flow_table);
             lflow_run(&ctx, &lports, &mcgroups, &local_datapaths,
-                      &patched_datapaths, &ct_zones, &flow_table);
+                      &patched_datapaths, &group_table, &ct_zones,
+                      &flow_table);
             if (chassis_id) {
                 physical_run(&ctx, mff_ovn_geneve,
                              br_int, chassis_id, &ct_zones, &flow_table,
                              &local_datapaths, &patched_datapaths);
             }
-            ofctrl_put(&flow_table);
+            ofctrl_put(&flow_table, &group_table);
             hmap_destroy(&flow_table);
-            mcgroup_index_destroy(&mcgroups);
-            lport_index_destroy(&lports);
         }
 
         sset_destroy(&all_lports);
-
-        struct local_datapath *cur_node, *next_node;
-        HMAP_FOR_EACH_SAFE (cur_node, next_node, hmap_node, &local_datapaths) {
-            hmap_remove(&local_datapaths, &cur_node->hmap_node);
-            free(cur_node);
-        }
-        hmap_destroy(&local_datapaths);
-
-        struct patched_datapath *pd_cur_node, *pd_next_node;
-        HMAP_FOR_EACH_SAFE (pd_cur_node, pd_next_node, hmap_node,
-                &patched_datapaths) {
-            hmap_remove(&patched_datapaths, &pd_cur_node->hmap_node);
-            free(pd_cur_node);
-        }
-        hmap_destroy(&patched_datapaths);
 
         unixctl_server_run(unixctl);
 
@@ -494,6 +469,7 @@ main(int argc, char *argv[])
         }
         ovsdb_idl_loop_commit_and_wait(&ovnsb_idl_loop);
         ovsdb_idl_loop_commit_and_wait(&ovs_idl_loop);
+        ovsdb_idl_track_clear(ovnsb_idl_loop.idl);
         poll_block();
         if (should_service_stop()) {
             exiting = true;
@@ -533,6 +509,18 @@ main(int argc, char *argv[])
     pinctrl_destroy();
 
     simap_destroy(&ct_zones);
+
+    bitmap_free(group_table.group_ids);
+    hmap_destroy(&group_table.desired_groups);
+
+    struct group_info *installed, *next_group;
+    HMAP_FOR_EACH_SAFE(installed, next_group, hmap_node,
+                       &group_table.existing_groups) {
+        hmap_remove(&group_table.existing_groups, &installed->hmap_node);
+        ds_destroy(&installed->group);
+        free(installed);
+    }
+    hmap_destroy(&group_table.existing_groups);
 
     ovsdb_idl_loop_destroy(&ovs_idl_loop);
     ovsdb_idl_loop_destroy(&ovnsb_idl_loop);
@@ -656,4 +644,19 @@ ct_zone_list(struct unixctl_conn *conn, int argc OVS_UNUSED,
 
     unixctl_command_reply(conn, ds_cstr(&ds));
     ds_destroy(&ds);
+}
+
+/* Get the desired SB probe timer from the OVS database and configure it into
+ * the SB database. */
+static void
+update_probe_interval(struct controller_ctx *ctx)
+{
+    const struct ovsrec_open_vswitch *cfg
+        = ovsrec_open_vswitch_first(ctx->ovs_idl);
+    int interval = (cfg
+                    ? smap_get_int(&cfg->external_ids,
+                                   "ovn-remote-probe-interval",
+                                   DEFAULT_PROBE_INTERVAL_MSEC)
+                    : DEFAULT_PROBE_INTERVAL_MSEC);
+    ovsdb_idl_set_probe_interval(ctx->ovnsb_idl, interval);
 }

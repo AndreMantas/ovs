@@ -73,6 +73,7 @@ docs = \
 	INSTALL.md \
 	INSTALL.Debian.md \
 	INSTALL.Docker.md \
+	INSTALL.DPDK-ADVANCED.md \
 	INSTALL.DPDK.md \
 	INSTALL.Fedora.md \
 	INSTALL.KVM.md \
@@ -114,7 +115,8 @@ EXTRA_DIST = \
 	build-aux/xml2nroff \
 	$(MAN_FRAGMENTS) \
 	$(MAN_ROOTS) \
-	Vagrantfile
+	Vagrantfile \
+	Vagrantfile-FreeBSD
 bin_PROGRAMS =
 sbin_PROGRAMS =
 bin_SCRIPTS =

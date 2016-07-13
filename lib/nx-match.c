@@ -879,8 +879,7 @@ nxm_put_ip(struct ofpbuf *b, const struct match *match, enum ofp_version oxm)
                 nxm_put_8(b, MFF_ICMPV6_CODE, oxm,
                           ntohs(flow->tp_dst));
             }
-            if (flow->tp_src == htons(ND_NEIGHBOR_SOLICIT) ||
-                flow->tp_src == htons(ND_NEIGHBOR_ADVERT)) {
+            if (is_nd(flow, NULL)) {
                 nxm_put_ipv6(b, MFF_ND_TARGET, oxm,
                              &flow->nd_target, &match->wc.masks.nd_target);
                 if (flow->tp_src == htons(ND_NEIGHBOR_SOLICIT)) {
@@ -918,7 +917,7 @@ nx_put_raw(struct ofpbuf *b, enum ofp_version oxm, const struct match *match,
     int match_len;
     int i;
 
-    BUILD_ASSERT_DECL(FLOW_WC_SEQ == 35);
+    BUILD_ASSERT_DECL(FLOW_WC_SEQ == 36);
 
     /* Metadata. */
     if (match->wc.masks.dp_hash) {

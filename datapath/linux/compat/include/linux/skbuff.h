@@ -39,6 +39,13 @@ static inline void skb_copy_to_linear_data_offset(struct sk_buff *skb,
 
 #endif	/* !HAVE_SKB_COPY_FROM_LINEAR_DATA_OFFSET */
 
+#ifndef HAVE_SKB_INNER_TRANSPORT_OFFSET
+static inline int skb_inner_transport_offset(const struct sk_buff *skb)
+{
+	return skb_inner_transport_header(skb) - skb->data;
+}
+#endif
+
 #ifndef HAVE_SKB_RESET_TAIL_POINTER
 static inline void skb_reset_tail_pointer(struct sk_buff *skb)
 {
@@ -333,4 +340,12 @@ static inline void skb_pop_mac_header(struct sk_buff *skb)
 {
 	skb->mac_header = skb->network_header;
 }
+
+#ifndef HAVE_SKB_CLEAR_HASH_IF_NOT_L4
+static inline void skb_clear_hash_if_not_l4(struct sk_buff *skb)
+{
+	if (!skb->l4_rxhash)
+		skb_clear_hash(skb);
+}
+#endif
 #endif

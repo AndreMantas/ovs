@@ -37,12 +37,13 @@
 #include "gso.h"
 #include "vport-netdev.h"
 
-#if LINUX_VERSION_CODE < KERNEL_VERSION(3,18,0)
-int rpl_iptunnel_xmit(struct sock *sk, struct rtable *rt, struct sk_buff *skb,
+#ifndef USE_UPSTREAM_TUNNEL
+void rpl_iptunnel_xmit(struct sock *sk, struct rtable *rt, struct sk_buff *skb,
                       __be32 src, __be32 dst, __u8 proto, __u8 tos, __u8 ttl,
                       __be16 df, bool xnet)
 {
-	int pkt_len = skb->len;
+	struct net_device *dev = skb->dev;
+	int pkt_len = skb->len - skb_inner_network_offset(skb);
 	struct iphdr *iph;
 	int err;
 
@@ -83,13 +84,13 @@ int rpl_iptunnel_xmit(struct sock *sk, struct rtable *rt, struct sk_buff *skb,
 	err = ip_local_out(skb);
 	if (unlikely(net_xmit_eval(err)))
 		pkt_len = 0;
-	return pkt_len;
+	iptunnel_xmit_stats(dev, pkt_len);
 }
 EXPORT_SYMBOL_GPL(rpl_iptunnel_xmit);
 
-struct sk_buff *ovs_iptunnel_handle_offloads(struct sk_buff *skb,
-					     bool csum_help, int gso_type_mask,
-					     void (*fix_segment)(struct sk_buff *))
+int ovs_iptunnel_handle_offloads(struct sk_buff *skb,
+				 bool csum_help, int gso_type_mask,
+				 void (*fix_segment)(struct sk_buff *))
 {
 	int err;
 
@@ -103,17 +104,18 @@ struct sk_buff *ovs_iptunnel_handle_offloads(struct sk_buff *skb,
 		goto error;
 	}
 
+#if LINUX_VERSION_CODE < KERNEL_VERSION(3,18,0)
 	if (gso_type_mask)
 		fix_segment = NULL;
 
 	OVS_GSO_CB(skb)->fix_segment = fix_segment;
-
+#endif
 	if (skb_is_gso(skb)) {
 		err = skb_unclone(skb, GFP_ATOMIC);
 		if (unlikely(err))
 			goto error;
 		skb_shinfo(skb)->gso_type |= gso_type_mask;
-		return skb;
+		return 0;
 	}
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(3,8,0)
@@ -133,29 +135,28 @@ struct sk_buff *ovs_iptunnel_handle_offloads(struct sk_buff *skb,
 	} else if (skb->ip_summed != CHECKSUM_PARTIAL)
 		skb->ip_summed = CHECKSUM_NONE;
 
-	return skb;
+	return 0;
 error:
-	kfree_skb(skb);
-	return ERR_PTR(err);
+	return err;
 }
 EXPORT_SYMBOL_GPL(ovs_iptunnel_handle_offloads);
 
-int rpl_iptunnel_pull_header(struct sk_buff *skb, int hdr_len, __be16 inner_proto)
+int rpl___iptunnel_pull_header(struct sk_buff *skb, int hdr_len,
+			       __be16 inner_proto, bool raw_proto, bool xnet)
 {
 	if (unlikely(!pskb_may_pull(skb, hdr_len)))
 		return -ENOMEM;
 
 	skb_pull_rcsum(skb, hdr_len);
 
-	if (inner_proto == htons(ETH_P_TEB)) {
+	if (!raw_proto && inner_proto == htons(ETH_P_TEB)) {
 		struct ethhdr *eh;
 
 		if (unlikely(!pskb_may_pull(skb, ETH_HLEN)))
 			return -ENOMEM;
 
 		eh = (struct ethhdr *)skb->data;
-
-		if (likely(ntohs(eh->h_proto) >= ETH_P_802_3_MIN))
+		if (likely(eth_proto_is_802_3(eh->h_proto)))
 			skb->protocol = eh->h_proto;
 		else
 			skb->protocol = htons(ETH_P_802_2);
@@ -164,18 +165,15 @@ int rpl_iptunnel_pull_header(struct sk_buff *skb, int hdr_len, __be16 inner_prot
 		skb->protocol = inner_proto;
 	}
 
-	nf_reset(skb);
-	secpath_reset(skb);
-	skb_clear_hash(skb);
-	skb_dst_drop(skb);
+	skb_clear_hash_if_not_l4(skb);
 	skb->vlan_tci = 0;
 	skb_set_queue_mapping(skb, 0);
-	skb->pkt_type = PACKET_HOST;
-	return 0;
-}
-EXPORT_SYMBOL_GPL(rpl_iptunnel_pull_header);
+	skb_scrub_packet(skb, xnet);
 
-#endif
+	return iptunnel_pull_offloads(skb);
+}
+EXPORT_SYMBOL_GPL(rpl___iptunnel_pull_header);
+#endif /* USE_UPSTREAM_TUNNEL */
 
 bool ovs_skb_is_encapsulated(struct sk_buff *skb)
 {
@@ -207,7 +205,7 @@ void ovs_ip_tunnel_rcv(struct net_device *dev, struct sk_buff *skb,
 
 	ovs_skb_dst_set(skb, (struct dst_entry *)tun_dst);
 
-#ifndef HAVE_METADATA_DST
+#ifndef USE_UPSTREAM_TUNNEL
 	netdev_port_receive(skb, &tun_dst->u.tun_info);
 #else
 	netif_rx(skb);
