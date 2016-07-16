@@ -324,6 +324,14 @@ static void update_mtu(struct ofproto *, struct ofport *);
 static void update_mtu_ofproto(struct ofproto *);
 static void meter_delete(struct ofproto *, uint32_t first, uint32_t last);
 static void meter_insert_rule(struct rule *);
+static enum ofperr ofproto_extract_packet_out(struct ofproto *p,
+                                              struct ofconn *ofconn,
+                                              const struct ofp_header *oh,
+                                              uint64_t *ofpacts_stub,
+                                              struct ofpbuf *ofpacts,
+                                              struct ofputil_packet_out *po,
+                                              struct dp_packet **payload,
+                                              struct flow *flow);
 
 /* unixctl. */
 static void ofproto_unixctl_init(void);
@@ -3388,6 +3396,66 @@ reject_slave_controller(struct ofconn *ofconn)
     }
 }
 
+/**
+ * Extracts, validates and initializes all the required fields to send a
+ * PacketOut to the datapath. The caller must free ofpacts and payload.
+ *
+ * Used by handle_packet_out() and handle_bundle_add()
+ *
+ * Returns 0 if successful, otherwise an OpenFlow error. */
+static enum ofperr
+ofproto_extract_packet_out(struct ofproto *p, struct ofconn *ofconn,
+                           const struct ofp_header *oh,
+                           uint64_t *ofpacts_stub, struct ofpbuf *ofpacts,
+                           struct ofputil_packet_out *po,
+                           struct dp_packet **payload, struct flow *flow)
+{
+    enum ofperr error;
+
+    /* Decode message. */
+    ofpbuf_use_stub(ofpacts, ofpacts_stub, sizeof ofpacts_stub);
+    error = ofputil_decode_packet_out(po, oh, ofpacts);
+    if (error) {
+        return error;
+    }
+    if (ofp_to_u16(po->in_port) >= p->max_ports
+        && ofp_to_u16(po->in_port) < ofp_to_u16(OFPP_MAX)) {
+        error = OFPERR_OFPBRC_BAD_PORT;
+    }
+
+    /* Get payload. */
+    if (po->buffer_id != UINT32_MAX) {
+        error = ofconn_pktbuf_retrieve(ofconn, po->buffer_id, payload, NULL);
+        if (error) {
+            goto exit;
+        }
+    } else {
+        /* Ensure that the L3 header is 32-bit aligned. */
+        *payload = dp_packet_clone_data_with_headroom(po->packet,
+                                                      po->packet_len, 2);
+    }
+
+    /* Verify actions against packet, then send packet if successful. */
+    flow_extract(*payload, flow);
+    flow->in_port.ofp_port = po->in_port;
+
+    /* Check actions like for flow mods.  We pass a 'table_id' of 0 to
+     * ofproto_check_consistency(), which isn't strictly correct because these
+     * actions aren't in any table.  This is OK as 'table_id' is only used to
+     * check instructions (e.g., goto-table), which can't appear on the action
+     * list of a packet-out. */
+    error = ofpacts_check_consistency(po->ofpacts, po->ofpacts_len,
+                                      flow, u16_to_ofp(p->max_ports),
+                                      0, p->n_tables,
+                                      ofconn_get_protocol(ofconn));
+    if (!error) {
+       error = ofproto_check_ofpacts(p, po->ofpacts, po->ofpacts_len);
+    }
+
+exit:
+    return error;
+}
+
 /* Checks that the 'ofpacts_len' bytes of action in 'ofpacts' are appropriate
  * for 'ofproto':
  *
@@ -3436,52 +3504,15 @@ handle_packet_out(struct ofconn *ofconn, const struct ofp_header *oh)
         goto exit;
     }
 
-    /* Decode message. */
-    ofpbuf_use_stub(&ofpacts, ofpacts_stub, sizeof ofpacts_stub);
-    error = ofputil_decode_packet_out(&po, oh, &ofpacts);
-    if (error) {
-        goto exit_free_ofpacts;
-    }
-    if (ofp_to_u16(po.in_port) >= p->max_ports
-        && ofp_to_u16(po.in_port) < ofp_to_u16(OFPP_MAX)) {
-        error = OFPERR_OFPBRC_BAD_PORT;
-        goto exit_free_ofpacts;
-    }
+    error = ofproto_extract_packet_out(p, ofconn, oh, ofpacts_stub, &ofpacts,
+                                       &po, &payload, &flow);
 
-    /* Get payload. */
-    if (po.buffer_id != UINT32_MAX) {
-        error = ofconn_pktbuf_retrieve(ofconn, po.buffer_id, &payload, NULL);
-        if (error) {
-            goto exit_free_ofpacts;
-        }
-    } else {
-        /* Ensure that the L3 header is 32-bit aligned. */
-        payload = dp_packet_clone_data_with_headroom(po.packet, po.packet_len, 2);
-    }
-
-    /* Verify actions against packet, then send packet if successful. */
-    flow_extract(payload, &flow);
-    flow.in_port.ofp_port = po.in_port;
-
-    /* Check actions like for flow mods.  We pass a 'table_id' of 0 to
-     * ofproto_check_consistency(), which isn't strictly correct because these
-     * actions aren't in any table.  This is OK as 'table_id' is only used to
-     * check instructions (e.g., goto-table), which can't appear on the action
-     * list of a packet-out. */
-    error = ofpacts_check_consistency(po.ofpacts, po.ofpacts_len,
-                                      &flow, u16_to_ofp(p->max_ports),
-                                      0, p->n_tables,
-                                      ofconn_get_protocol(ofconn));
     if (!error) {
-        error = ofproto_check_ofpacts(p, po.ofpacts, po.ofpacts_len);
-        if (!error) {
-            error = p->ofproto_class->packet_out(p, payload, &flow,
-                                                 po.ofpacts, po.ofpacts_len);
-        }
+        error = p->ofproto_class->packet_out(p, payload, &flow,
+                                             po.ofpacts, po.ofpacts_len);
     }
     dp_packet_delete(payload);
 
-exit_free_ofpacts:
     ofpbuf_uninit(&ofpacts);
 exit:
     return error;
@@ -7255,54 +7286,9 @@ handle_bundle_add(struct ofconn *ofconn, const struct ofp_header *oh)
         uint64_t ofpacts_stub[1024 / 8];
         struct ofpbuf ofpacts;
 
-        /* Decode message. */
-        ofpbuf_use_stub(&ofpacts, ofpacts_stub, sizeof ofpacts_stub);
-        error = ofputil_decode_packet_out(&(bmsg->opo.po), badd.msg, &ofpacts);
-        /* Same validation steps as in handle_packet_out  */
-        if (error) {
-            goto exit;
-        }
-
-        /* Move actions to heap. */
-        bmsg->opo.po.ofpacts = ofpbuf_steal_data(&ofpacts);
-
-        if (ofp_to_u16(bmsg->opo.po.in_port) >= ofproto->max_ports
-            && ofp_to_u16(bmsg->opo.po.in_port) < ofp_to_u16(OFPP_MAX)) {
-            error = OFPERR_OFPBRC_BAD_PORT;
-            goto exit;
-        }
-
-        /* Get payload. */
-        if (bmsg->opo.po.buffer_id != UINT32_MAX) {
-            error = ofconn_pktbuf_retrieve(ofconn, bmsg->opo.po.buffer_id,
-                                           &(bmsg->opo.payload), NULL);
-            if (error) {
-                goto exit;
-            }
-        } else {
-            /* Ensure that the L3 header is 32-bit aligned. */
-            bmsg->opo.payload = dp_packet_clone_data_with_headroom(
-                                                        bmsg->opo.po.packet,
-                                                        bmsg->opo.po.packet_len,
-                                                        2);
-        }
-
-        /* Verify actions against packet */
-        flow_extract(bmsg->opo.payload, &(bmsg->opo.flow));
-        bmsg->opo.flow.in_port.ofp_port = bmsg->opo.po.in_port;
-        /* Check actions like for flow mods. */
-        error = ofpacts_check_consistency(bmsg->opo.po.ofpacts,
-                                          bmsg->opo.po.ofpacts_len,
-                                          &(bmsg->opo.flow),
-                                          u16_to_ofp(ofproto->max_ports),
-                                          0, ofproto->n_tables,
-                                          ofconn_get_protocol(ofconn));
-        if (error) {
-            goto exit;
-        }
-
-        error = ofproto_check_ofpacts(ofproto, bmsg->opo.po.ofpacts,
-                                      bmsg->opo.po.ofpacts_len);
+        ofproto_extract_packet_out(ofproto, ofconn, badd.msg, ofpacts_stub,
+                                   &ofpacts, &bmsg->opo.po,
+                                   &bmsg->opo.payload, &bmsg->opo.flow);
     } else {
         OVS_NOT_REACHED();
     }
@@ -7311,7 +7297,7 @@ handle_bundle_add(struct ofconn *ofconn, const struct ofp_header *oh)
         error = ofp_bundle_add_message(ofconn, badd.bundle_id, badd.flags,
                                        bmsg);
     }
-exit:
+
     if (error) {
         ofp_bundle_entry_free(bmsg);
     }
